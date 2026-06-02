@@ -33,6 +33,21 @@ SERVICE_ACCOUNT = Path(
 BQ_PROJECT       = "amazon-sp-api-openbridge"
 BQ_LISTINGS_VIEW = "amazon-sp-api-openbridge.2_Silver_Aux.vw_all_listings_report"
 
+BQ_SQP_DATASET         = "3_Bronze_Business_Reports"
+BQ_SQP_TABLE           = "td_search_query_performance"
+BQ_SQP_TABLE_ID        = f"{BQ_PROJECT}.{BQ_SQP_DATASET}.{BQ_SQP_TABLE}"
+
+# Silver — combined + deduplicated (OpenBridge Silver + Bronze scraped)
+BQ_SQP_SILVER_DATASET       = "2_Silver_Business_Reports"
+BQ_SQP_OPENBRIDGE_VIEW      = f"{BQ_PROJECT}.{BQ_SQP_SILVER_DATASET}.vw_search_query_performance"
+BQ_SQP_SILVER_VIEW          = "vw_sqp_combined"
+BQ_SQP_SILVER_VIEW_ID       = f"{BQ_PROJECT}.{BQ_SQP_SILVER_DATASET}.{BQ_SQP_SILVER_VIEW}"
+
+# Gold — ready for consumption
+BQ_SQP_GOLD_DATASET         = "1_Gold_Business_Reports"
+BQ_SQP_GOLD_VIEW            = "vw_search_query_performance"
+BQ_SQP_GOLD_VIEW_ID         = f"{BQ_PROJECT}.{BQ_SQP_GOLD_DATASET}.{BQ_SQP_GOLD_VIEW}"
+
 # ── Marketplaces ──────────────────────────────────────────────────────────────
 # sc_url   : Seller Central base URL for this region
 # sc_name  : Display name used in Seller Central's marketplace switcher

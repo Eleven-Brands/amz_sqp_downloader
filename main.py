@@ -37,6 +37,7 @@ from config import (
 from bq_client import get_asins
 from downloader import SQPDownloader, SessionExpiredError
 import tratamento
+import bq_ingest
 import notifier
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -211,11 +212,13 @@ def cmd_weekly(
         return
 
     tratamento.run()
+    rows = bq_ingest.run("incremental")
     week_summary = " / ".join(dict.fromkeys(str(w) for w in [ws_na, ws_eu] if w))
     notifier.send("Weekly run complete", f"Week {week_summary} done for: {', '.join(targets)}")
     notifier.send_clickup(
         f"✅ **SQP Download concluído** — semana `{week_summary}`\n"
-        f"Marketplaces: {', '.join(targets)}"
+        f"Marketplaces: {', '.join(targets)}\n"
+        f"BigQuery: `{rows:,}` linhas carregadas → `vw_sqp_combined` atualizado"
     )
     logger.info("Weekly run complete.")
 
@@ -268,15 +271,24 @@ def cmd_backfill(
                     return
 
     tratamento.run()
+    rows = bq_ingest.run("incremental")
     notifier.send(
         "Backfill complete",
-        f"{from_date} → {to_date} | markets: {', '.join(targets)}"
+        f"{from_date} → {to_date} | markets: {', '.join(targets)} | BQ: {rows:,} rows"
     )
     logger.info("Backfill complete.")
 
 
 def cmd_process() -> None:
     tratamento.run()
+
+
+def cmd_ingest(mode: str) -> None:
+    rows = bq_ingest.run(mode)
+    notifier.send_clickup(
+        f"✅ **SQP → BigQuery** — `{rows:,}` linhas carregadas (`{mode}`)\n"
+        f"Silver `vw_sqp_combined` e Gold `vw_search_query_performance` atualizados"
+    )
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -322,6 +334,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # process
     sub.add_parser("process", help="Re-run consolidation (tratamento) only")
 
+    # ingest
+    i = sub.add_parser("ingest", help="Upload resultado_final.csv to BigQuery and refresh vw_sqp_combined")
+    i.add_argument(
+        "--mode", choices=["incremental", "full"], default="incremental",
+        help="incremental (default): append new weeks only. full: truncate and reload.",
+    )
+
     return p
 
 
@@ -353,6 +372,9 @@ def main() -> None:
 
     elif args.cmd == "process":
         cmd_process()
+
+    elif args.cmd == "ingest":
+        cmd_ingest(args.mode)
 
 
 if __name__ == "__main__":

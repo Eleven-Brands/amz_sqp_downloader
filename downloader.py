@@ -13,6 +13,7 @@ import csv
 import io
 import json
 import logging
+import math
 import random
 import time
 from datetime import date, datetime, timedelta
@@ -732,6 +733,330 @@ class SQPDownloader:
         logger.error(f"[{tag}] Download Manager: no ready file after {_DM_MAX_WAIT}s")
         logger.error(f"[{tag}] Download did not complete -- check discover/ screenshots")
         return False
+
+    # ── Brand Catalog Performance sniffer ────────────────────────────────────
+
+    _CATALOG_PATH = "/brand-analytics/dashboard/brand-catalog-performance"
+
+    def sniff_catalog(self, marketplace: str, ws: date) -> dict | None:
+        """Navigate to the Brand Catalog Performance dashboard and intercept
+        the internal API call the page makes. Saves request + response to
+        debug/catalog_sniff_<marketplace>.json and returns the parsed response.
+
+        Run this once to discover the exact reportId, column names, and body
+        shape before implementing a full downloader.
+        """
+        cfg      = MARKETPLACES[marketplace]
+        sc_url   = cfg["sc_url"]
+        country  = cfg["country_id"]
+        week_end = (ws + timedelta(days=6)).isoformat()
+
+        url = (
+            f"{sc_url}{self._CATALOG_PATH}"
+            f"?reporting-range=weekly"
+            f"&weekly-week={week_end}"
+            f"&view-id=brand-catalog-performance-default-view"
+            f"&country-id={country}"
+        )
+
+        pg = self.page
+        sniff: dict = {}
+
+        api_pattern = "**/brand-catalog-performance/reports"
+
+        def _handle_route(route):
+            req = route.request
+            try:
+                body_text = req.post_data or ""
+                try:
+                    body_parsed = json.loads(body_text)
+                except Exception:
+                    body_parsed = body_text
+
+                sniff["request_url"]  = req.url
+                sniff["request_body"] = body_parsed
+                sniff["request_headers"] = dict(req.headers)
+
+                # Forward the real request and capture the response
+                response = route.fetch()
+                try:
+                    resp_json = response.json()
+                except Exception:
+                    resp_json = response.text()
+
+                sniff["response_status"] = response.status
+                sniff["response_body"]   = resp_json
+
+                route.fulfill(
+                    status=response.status,
+                    headers=dict(response.headers),
+                    body=response.body(),
+                )
+            except Exception as exc:
+                logger.error(f"[sniff_catalog] route handler error: {exc}")
+                route.continue_()
+
+        pg.route(api_pattern, _handle_route)
+
+        logger.info(f"[sniff_catalog] Navigating to: {url}")
+        pg.goto(url, timeout=30_000)
+        _ready(pg, timeout=25_000)
+
+        if _is_logged_out(pg):
+            raise SessionExpiredError()
+
+        # Wait up to 15s for the API call to be intercepted
+        deadline = time.time() + 15
+        while "response_body" not in sniff and time.time() < deadline:
+            pg.wait_for_timeout(500)
+
+        pg.unroute(api_pattern, _handle_route)
+        _screenshot(pg, f"catalog_sniff_{marketplace}")
+
+        if not sniff:
+            logger.error("[sniff_catalog] No API call intercepted — page may not have loaded data")
+            return None
+
+        out_path = DEBUG_DIR / f"catalog_sniff_{marketplace}.json"
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(sniff, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        logger.info(f"[sniff_catalog] Saved to {out_path}")
+
+        # Print a summary so the dev can see the shape immediately
+        req_body = sniff.get("request_body", {})
+        resp_body = sniff.get("response_body", {})
+        print("\n── REQUEST BODY ──────────────────────────────")
+        print(json.dumps(req_body, indent=2, ensure_ascii=False))
+        reports = (resp_body or {}).get("reportsV2") or []
+        if reports:
+            first = reports[0]
+            rows  = first.get("rows") or []
+            print(f"\n── RESPONSE: {len(rows)} rows, totalItems={first.get('totalItems')}")
+            if rows:
+                print("── FIRST ROW KEYS:")
+                print(json.dumps(list(rows[0].keys()), indent=2))
+                print("── FIRST ROW VALUES:")
+                print(json.dumps(rows[0], indent=2, ensure_ascii=False))
+        else:
+            print(f"\n── RESPONSE STATUS: {sniff.get('response_status')}")
+            print("── RESPONSE BODY (truncated):")
+            body_str = json.dumps(resp_body, ensure_ascii=False)
+            print(body_str[:1000])
+
+        return sniff
+
+    # ── Brand Catalog Performance downloader ─────────────────────────────────
+
+    _CATALOG_COLUMNS: "list[tuple[str, str]]" = [
+        ("asin",                            "ASIN"),
+        ("asin-title",                      "Product Title"),
+        ("category",                        "Category"),
+        ("impressions-count",               "Impressions"),
+        ("clicks",                          "Clicks"),
+        ("ctr-clicks",                      "CTR %"),
+        ("cart-adds-count",                 "Cart Adds"),
+        ("purchases-count",                 "Purchases"),
+        ("conversion-rate",                 "Conversion Rate %"),
+        ("total-sales-purchases",           "Total Sales"),
+        ("impression-price",                "Impression Price"),
+        ("click-price",                     "Click Price"),
+        ("cart-adds-price",                 "Cart Add Price"),
+        ("purchase-price",                  "Purchase Price"),
+        ("same-day-shipping-impressions",   "Impressions: Same Day"),
+        ("one-day-shipping-impressions",    "Impressions: 1D"),
+        ("two-day-shipping-impressions",    "Impressions: 2D"),
+        ("same-day-shipping-clicks",        "Clicks: Same Day"),
+        ("one-day-shipping-clicks",         "Clicks: 1D"),
+        ("two-day-shipping-clicks",         "Clicks: 2D"),
+        ("same-day-shipping-cart-adds",     "Cart Adds: Same Day"),
+        ("one-day-shipping-cart-adds",      "Cart Adds: 1D"),
+        ("two-day-shipping-cart-adds",      "Cart Adds: 2D"),
+        ("same-day-shipping-purchases",     "Purchases: Same Day"),
+        ("one-day-shipping-purchases",      "Purchases: 1D"),
+        ("two-day-shipping-purchases",      "Purchases: 2D"),
+        ("marketplace",                     "Marketplace"),
+        ("period",                          "Reporting Date"),
+    ]
+
+    def _fetch_catalog_page(
+        self,
+        pg: Page,
+        marketplace: str,
+        ws: date,
+        page_number: int,
+        page_size: int,
+        tag: str,
+    ) -> dict | None:
+        """Fetch one page of Brand Catalog Performance data via the internal API."""
+        cfg      = MARKETPLACES[marketplace]
+        sc_url   = cfg["sc_url"]
+        country  = cfg["country_id"]
+        week_end = (ws + timedelta(days=6)).isoformat()
+
+        body = {
+            "viewId": "brand-catalog-performance-default-view",
+            "filterSelections": [
+                {"id": "reporting-range", "value": "weekly", "valueType": None},
+                {"id": "weekly-week",     "value": week_end, "valueType": "weekly"},
+            ],
+            "selectedCountries": [country],
+            "reportId": "brand-catalog-performance-report-table",
+            "reportOperations": [{
+                "ascending":      False,
+                "pageNumber":     page_number,
+                "pageSize":       page_size,
+                "reportId":       "brand-catalog-performance-report-table",
+                "reportType":     "TABLE",
+                "sortByColumnId": "impressions-count",
+            }],
+        }
+
+        api_url  = f"{sc_url}/api/brand-analytics/v1/dashboard/brand-catalog-performance/reports"
+        referer  = (
+            f"{sc_url}/brand-analytics/dashboard/brand-catalog-performance"
+            f"?reporting-range=weekly&weekly-week={week_end}"
+            f"&view-id=brand-catalog-performance-default-view&country-id={country}"
+        )
+        body_js  = json.dumps(body)
+
+        js = f"""async () => {{
+            const csrfMeta = document.querySelector('meta[name="anti-csrftoken-a2z"]');
+            if (!csrfMeta) return {{__error: "no_csrf_meta"}};
+            const csrf = csrfMeta.getAttribute("content");
+            if (!csrf) return {{__error: "csrf_empty"}};
+            try {{
+                const resp = await fetch("{api_url}", {{
+                    method: "POST",
+                    headers: {{
+                        "Anti-Csrftoken-A2z": csrf,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "Origin": "{sc_url}",
+                        "Referer": "{referer}",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Sec-Fetch-Site": "same-origin",
+                    }},
+                    credentials: "include",
+                    body: JSON.stringify({body_js}),
+                }});
+                if (!resp.ok) {{
+                    let errBody = "";
+                    try {{ errBody = await resp.text(); }} catch(_) {{}}
+                    return {{__error: "http_" + resp.status, __body: errBody.slice(0, 800)}};
+                }}
+                return await resp.json();
+            }} catch(e) {{
+                return {{__error: e.message}};
+            }}
+        }}"""
+
+        try:
+            result = pg.evaluate(js)
+        except Exception as exc:
+            logger.error(f"[{tag}] catalog API evaluate error: {exc}")
+            return None
+
+        if not isinstance(result, dict):
+            logger.error(f"[{tag}] catalog API: unexpected type {type(result)}")
+            return None
+
+        if "__error" in result:
+            logger.error(f"[{tag}] catalog API error: {result['__error']} body={result.get('__body','')!r}")
+            return None
+
+        reports = result.get("reportsV2") or []
+        if not reports:
+            logger.info(f"[{tag}] catalog API: empty reportsV2 (0-item week)")
+            return {}
+
+        return reports[0]
+
+    def download_catalog_week(
+        self,
+        marketplace: str,
+        ws: date,
+        save_dir: Path,
+    ) -> bool:
+        """Download Brand Catalog Performance for one marketplace + week.
+
+        Fetches all pages and writes a single CSV to save_dir.
+        Returns True on success (including 0-row weeks).
+        """
+        save_dir.mkdir(parents=True, exist_ok=True)
+        week_end = (ws + timedelta(days=6)).isoformat()
+        out      = save_dir / f"catalog_{marketplace}_{ws.isoformat()}.csv"
+        tag      = f"catalog_{marketplace}_{ws}"
+
+        if out.exists():
+            logger.info(f"Skipping (already exists): {out.name}")
+            return True
+
+        cfg      = MARKETPLACES[marketplace]
+        mkt_name = cfg.get("sc_name", marketplace)
+        period   = f"{ws.isoformat()} to {week_end}"
+
+        try:
+            # Navigate to the catalog page so CSRF token is available
+            catalog_url = (
+                f"{cfg['sc_url']}/brand-analytics/dashboard/brand-catalog-performance"
+                f"?reporting-range=weekly&weekly-week={week_end}"
+                f"&view-id=brand-catalog-performance-default-view&country-id={cfg['country_id']}"
+            )
+            logger.info(f"[{tag}] Navigating to catalog page")
+            pg = self.page
+            pg.goto(catalog_url, timeout=30_000)
+            _ready(pg, timeout=20_000)
+            if _is_logged_out(pg):
+                raise SessionExpiredError()
+
+            # Fetch first page to discover totalItems
+            _PAGE_SIZE = 100
+            first = self._fetch_catalog_page(pg, marketplace, ws, 1, _PAGE_SIZE, tag)
+            if first is None:
+                logger.error(f"[{tag}] First page fetch failed")
+                return False
+
+            total_items = first.get("totalItems", 0)
+            all_rows: list[dict] = list(first.get("rows") or [])
+            logger.info(f"[{tag}] totalItems={total_items}, got {len(all_rows)} on page 1")
+
+            # Fetch remaining pages
+            total_pages = math.ceil(total_items / _PAGE_SIZE)
+            for page_num in range(2, total_pages + 1):
+                _jitter(1.0, 2.5)
+                page_data = self._fetch_catalog_page(pg, marketplace, ws, page_num, _PAGE_SIZE, tag)
+                if page_data is None:
+                    logger.error(f"[{tag}] Failed on page {page_num}, aborting")
+                    return False
+                rows = page_data.get("rows") or []
+                all_rows.extend(rows)
+                logger.info(f"[{tag}] Page {page_num}/{total_pages}: +{len(rows)} rows (total {len(all_rows)})")
+
+            headers = [label for _, label in self._CATALOG_COLUMNS]
+            col_ids = [col_id for col_id, _ in self._CATALOG_COLUMNS]
+
+            tmp = out.with_suffix(".tmp")
+            with io.open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for row in all_rows:
+                    row["marketplace"] = mkt_name
+                    row["period"]      = period
+                    writer.writerow([row.get(c, "") for c in col_ids])
+            tmp.rename(out)
+
+            logger.info(f"[{tag}] {len(all_rows)} rows -> {out.name}")
+            return True
+
+        except SessionExpiredError:
+            raise
+        except Exception as exc:
+            logger.error(f"[{tag}] Unexpected error: {exc}", exc_info=True)
+            _screenshot(self.page, f"error_{tag}")
+            return False
 
     # ── Public: single download ───────────────────────────────────────────────
 

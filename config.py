@@ -12,6 +12,7 @@ DRIVE_BASE = Path(__file__).parent
 LOCAL_BASE = Path(os.getenv("SQP_LOCAL_DIR", r"C:\SQP"))
 
 RAW_DIR        = DRIVE_BASE / "raw"
+CATALOG_RAW_DIR= DRIVE_BASE / "raw_catalog"
 PROCESSED_DIR  = DRIVE_BASE / "processed"
 STATE_DIR      = DRIVE_BASE / "state"
 DEBUG_DIR      = DRIVE_BASE / "debug"

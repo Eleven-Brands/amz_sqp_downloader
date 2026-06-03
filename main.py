@@ -32,7 +32,7 @@ from pathlib import Path
 
 from config import (
     DRIVE_BASE, LOCAL_BASE, LOG_DIR, MARKETPLACES, SQP_MARKETPLACES,
-    RAW_DIR, STATE_DIR, last_available_week, week_start, weeks_in_range,
+    RAW_DIR, CATALOG_RAW_DIR, STATE_DIR, last_available_week, week_start, weeks_in_range,
 )
 from bq_client import get_asins
 from downloader import SQPDownloader, SessionExpiredError
@@ -228,6 +228,7 @@ def cmd_backfill(
     to_date: date,
     markets: list[str] | None,
     skip: list[str] | None,
+    no_ingest: bool = False,
 ) -> None:
     all_weeks = list(weeks_in_range(from_date, to_date))
     skip_set  = set(skip or [])
@@ -271,12 +272,108 @@ def cmd_backfill(
                     return
 
     tratamento.run()
+    if no_ingest:
+        logger.info("Backfill complete (BQ ingest skipped).")
+        notifier.send("Backfill complete (no ingest)", f"{from_date} -> {to_date} | {', '.join(targets)}")
+        return
     rows = bq_ingest.run("incremental")
     notifier.send(
         "Backfill complete",
         f"{from_date} → {to_date} | markets: {', '.join(targets)} | BQ: {rows:,} rows"
     )
     logger.info("Backfill complete.")
+
+
+def cmd_catalog_weekly(markets: list[str] | None, ws: date | None) -> None:
+    """Download Brand Catalog Performance for one week across all (or specified) marketplaces."""
+    target_week = ws or last_available_week()
+    targets     = markets or list(SQP_MARKETPLACES)
+    errors: list[str] = []
+
+    logger.info(f"Catalog weekly run — week {target_week} — {targets}")
+
+    with SQPDownloader(headless=False) as dl:
+        for mkt in targets:
+            sc_url = MARKETPLACES[mkt]["sc_url"]
+            if not dl.check_session(sc_url):
+                errors.append(f"Session expired before {mkt}. Run: python main.py setup --marketplace {mkt}")
+                break
+            dl.switch_marketplace(mkt)
+            save_dir = CATALOG_RAW_DIR / mkt
+            try:
+                ok = dl.download_catalog_week(mkt, target_week, save_dir)
+                if not ok:
+                    errors.append(f"{mkt} week {target_week}: download failed")
+            except SessionExpiredError:
+                errors.append(f"Session expired at {mkt}. Run setup and retry.")
+                break
+
+    if errors:
+        for err in errors:
+            logger.error(err)
+        setup_hint = "\n".join(f"`{e}`" for e in errors)
+        notifier.send("Session expired (catalog)", "\n".join(errors))
+        notifier.send_clickup(f"⚠️ **Catalog Download — sessão expirada**\n{setup_hint}")
+    else:
+        logger.info(f"Catalog weekly done — week {target_week} — {targets}")
+        notifier.send("Catalog weekly complete", f"Week {target_week} | {', '.join(targets)}")
+        notifier.send_clickup(
+            f"✅ **Catalog Download concluído** — semana `{target_week}`\n"
+            f"Marketplaces: {', '.join(targets)}"
+        )
+        print(f"\nFiles saved to: {CATALOG_RAW_DIR}")
+
+
+def cmd_catalog_backfill(from_date: date, to_date: date, markets: list[str] | None) -> None:
+    """Download Brand Catalog Performance for all weeks in a date range."""
+    all_weeks = list(weeks_in_range(from_date, to_date))
+    targets   = markets or list(SQP_MARKETPLACES)
+
+    logger.info(f"Catalog backfill: {from_date} -> {to_date} | {len(all_weeks)} weeks | {targets}")
+
+    with SQPDownloader(headless=False) as dl:
+        for mkt in targets:
+            sc_url = MARKETPLACES[mkt]["sc_url"]
+            if not dl.check_session(sc_url):
+                msg = f"Session expired before {mkt} catalog backfill. Log in and re-run."
+                logger.error(msg)
+                notifier.send("Session expired (catalog backfill)", msg)
+                notifier.send_clickup(f"⚠️ **Catalog Backfill — sessão expirada**\n`{msg}`")
+                return
+            dl.switch_marketplace(mkt)
+            save_dir = CATALOG_RAW_DIR / mkt
+            for ws in all_weeks:
+                try:
+                    dl.download_catalog_week(mkt, ws, save_dir)
+                except SessionExpiredError:
+                    msg = f"Session expired at {mkt}/{ws}. Log in and re-run."
+                    logger.error(msg)
+                    notifier.send("Session expired (catalog backfill)", msg)
+                    notifier.send_clickup(f"⚠️ **Catalog Backfill — sessão expirada**\n`{msg}`")
+                    return
+
+    logger.info("Catalog backfill complete.")
+    notifier.send("Catalog backfill complete", f"{from_date} -> {to_date} | {', '.join(targets)}")
+    notifier.send_clickup(
+        f"✅ **Catalog Backfill concluído** — `{from_date}` → `{to_date}`\n"
+        f"Marketplaces: {', '.join(targets)}"
+    )
+    print(f"\nFiles saved to: {CATALOG_RAW_DIR}")
+
+
+def cmd_sniff_catalog(marketplace: str, ws: date | None) -> None:
+    """Navigate to Brand Catalog Performance and capture the internal API call."""
+    target_week = ws or last_available_week()
+    sc_url = MARKETPLACES[marketplace]["sc_url"]
+    with SQPDownloader(headless=False) as dl:
+        if not dl.check_session(sc_url):
+            print("Session expired. Run 'python main.py setup' first.")
+            return
+        result = dl.sniff_catalog(marketplace, target_week)
+        if result:
+            print(f"\nFull sniff saved to: debug/catalog_sniff_{marketplace}.json")
+        else:
+            print("\nNo API call intercepted. Check debug/ for screenshot.")
 
 
 def cmd_process() -> None:
@@ -330,6 +427,26 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--marketplace", nargs="*", default=None, choices=list(MARKETPLACES))
     b.add_argument("--skip", nargs="*", default=None, choices=list(MARKETPLACES),
                    help="Marketplaces to skip (e.g. US if already done)")
+    b.add_argument("--no-ingest", action="store_true",
+                   help="Skip BigQuery ingestion after download")
+
+    # catalog-weekly
+    cw = sub.add_parser("catalog-weekly", help="Download Brand Catalog Performance for last week (all or specified marketplaces)")
+    cw.add_argument("--marketplace", nargs="*", default=None, choices=list(MARKETPLACES))
+    cw.add_argument("--week", default=None,
+                    help="Override week (any date in the week, YYYY-MM-DD). Defaults to last available week.")
+
+    # catalog-backfill
+    cb = sub.add_parser("catalog-backfill", help="Download Brand Catalog Performance for all weeks in a date range")
+    cb.add_argument("--from-date", required=True, help="Start date (YYYY-MM-DD)")
+    cb.add_argument("--to-date", default=None, help="End date (defaults to last available week)")
+    cb.add_argument("--marketplace", nargs="*", default=None, choices=list(MARKETPLACES))
+
+    # sniff-catalog
+    sc = sub.add_parser("sniff-catalog", help="Intercept Brand Catalog Performance API call to discover request/response shape")
+    sc.add_argument("--marketplace", default="US", choices=list(MARKETPLACES))
+    sc.add_argument("--week", default=None,
+                    help="Week to sniff (any date in the week, YYYY-MM-DD). Defaults to last available week.")
 
     # process
     sub.add_parser("process", help="Re-run consolidation (tratamento) only")
@@ -368,7 +485,24 @@ def main() -> None:
             if args.to_date
             else last_available_week()
         )
-        cmd_backfill(from_date, to_date, args.marketplace, args.skip)
+        cmd_backfill(from_date, to_date, args.marketplace, args.skip, no_ingest=args.no_ingest)
+
+    elif args.cmd == "catalog-weekly":
+        ws = week_start(date.fromisoformat(args.week)) if args.week else None
+        cmd_catalog_weekly(args.marketplace, ws)
+
+    elif args.cmd == "catalog-backfill":
+        from_date = week_start(date.fromisoformat(args.from_date))
+        to_date   = (
+            week_start(date.fromisoformat(args.to_date))
+            if args.to_date
+            else last_available_week()
+        )
+        cmd_catalog_backfill(from_date, to_date, args.marketplace)
+
+    elif args.cmd == "sniff-catalog":
+        ws = week_start(date.fromisoformat(args.week)) if args.week else None
+        cmd_sniff_catalog(args.marketplace, ws)
 
     elif args.cmd == "process":
         cmd_process()
